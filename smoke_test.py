@@ -1007,6 +1007,85 @@ assert call("GET", f"/api/plan/{rwid}")["result"]["metrics"]["u1_mag_g_mm"] == \
 print("reweigh-plan validation/read-only OK")
 
 
+# ---- 库存配重补偿(只读, 按放置枚数分层精确枚举槽位×质量组合) ----
+def cw_call(plan_id, weights, limit, max_weights):
+    found = find("POST", f"/api/plan/{plan_id}/counterweight-compensation")
+    fn, args = (found if isinstance(found, tuple) else (found, ()))
+    req = types.SimpleNamespace(
+        weights=[types.SimpleNamespace(
+            mass_g=float(w[0]), stock=int(w[1]),
+            model_dump=(lambda w=w: {"mass_g": float(w[0]), "stock": int(w[1])}))
+            for w in weights],
+        u1_limit_g_mm=float(limit),
+        max_weights=int(max_weights),
+    )
+    return fn(*args, req)
+
+# 确定性方案: 单支 50 g 试管锁定在槽 0(补偿前 |U₁|=5000∠0°), 其余槽空闲
+cw_body = dict(rw_body)
+cw_body["name"] = "配重补偿方案"
+cw_body["tubes"] = [{"id": 1, "mass": 50, "locked": True, "slot": 0}]
+rec_cw = call("POST", "/api/plan", cw_body)
+cwid = rec_cw["id"]
+assert abs(rec_cw["result"]["metrics"]["u1_mag_g_mm"] - 5000.0) < 1e-6
+# 补偿前已达标(限值 6000 > 5000): 放置 0 枚
+cw0 = cw_call(cwid, [(50, 3)], 6000.0, 3)
+assert cw0["feasible"] is True and cw0["weights_used"] == 0
+assert cw0["placements"] == [] and cw0["within_limit"] is True
+assert abs(cw0["baseline"]["u1_mag_g_mm"] - 5000.0) < 1e-6
+# 1 枚 50 g 放对径槽 6 恰好对消: 残余 0 ≤ 100
+cw1 = cw_call(cwid, [(50, 1)], 100.0, 3)
+assert cw1["feasible"] is True and cw1["weights_used"] == 1
+assert cw1["placements"][0]["slot"] == 6 and cw1["placements"][0]["mass_g"] == 50.0
+assert abs(cw1["final"]["u1_mag_g_mm"]) < 1e-6
+assert abs(cw1["improvement_g_mm"] - 5000.0) < 1e-6
+# 只有 25 g(库存 2): 1 枚最优残余 2500 超限, 2 枚放槽 5/7 达标(最少枚数 2)
+cw2 = cw_call(cwid, [(25, 2)], 1000.0, 3)
+assert cw2["feasible"] is True and cw2["weights_used"] == 2
+assert [x["slot"] for x in cw2["placements"]] == [5, 7]
+assert abs(cw2["final"]["u1_mag_g_mm"]
+           - (5000.0 - 2500.0 * _math.sqrt(3.0))) < 1e-6
+# 25 g 仅 1 件库存: 放 2 枚的组合不存在, 无法达标; 给出残余最低组合与超限量
+cw_no = cw_call(cwid, [(25, 1)], 1000.0, 3)
+assert cw_no["feasible"] is False and cw_no["within_limit"] is False
+assert cw_no["weights_used"] == 1 and cw_no["placements"][0]["slot"] == 6
+assert abs(cw_no["final"]["u1_mag_g_mm"] - 2500.0) < 1e-6
+assert abs(cw_no["excess_g_mm"] - 1500.0) < 1e-6
+assert "不达标" in cw_no["reason"]
+# 同质量两种配重合并库存: 25 g×1 + 25 g×1 与 25 g×2 同解
+cw_merge = cw_call(cwid, [(25, 1), (25, 1)], 1000.0, 3)
+assert cw_merge["feasible"] is True and cw_merge["weights_used"] == 2
+assert [x["slot"] for x in cw_merge["placements"]] == [5, 7]
+# 枚数分层: 上限 0 枚时只能给出基线对照, 不误报达标
+cw_cap0 = cw_call(cwid, [(50, 3)], 100.0, 0)
+assert cw_cap0["feasible"] is False and cw_cap0["weights_used"] == 0
+assert abs(cw_cap0["final"]["u1_mag_g_mm"] - 5000.0) < 1e-6
+print("counterweight feasible/infeasible/merge OK")
+
+# 校验错误: 配重 0 种 / 7 种 / 质量非正 / 库存为负 / 负限值 / 枚数越界 -> 400
+for bad_cw in (
+    (cwid, [], 100.0, 1),                    # 配重种类为空
+    (cwid, [(5, 1)] * 7, 100.0, 1),          # 超过 6 种
+    (cwid, [(0, 1)], 100.0, 1),              # 质量非正
+    (cwid, [(5, -1)], 100.0, 1),             # 库存为负
+    (cwid, [(5, 1)], -1.0, 1),               # 负限值
+    (cwid, [(5, 1)], 100.0, 4),              # 放置枚数超过 3
+):
+    try:
+        cw_call(*bad_cw); raise SystemExit("should 400")
+    except main.HTTPException as e:
+        assert e.status_code == 400, (bad_cw, e)
+# 方案不存在 -> 404
+try:
+    cw_call(999, [(5, 1)], 100.0, 1); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+# 只读: 补偿规划后原方案指标不变
+assert call("GET", f"/api/plan/{cwid}")["result"]["metrics"]["u1_mag_g_mm"] == \
+    rec_cw["result"]["metrics"]["u1_mag_g_mm"]
+print("counterweight validation/read-only OK")
+
+
 # ---- 互斥试管隔离(精确完全枚举; 禁用槽仍占物理相邻关系) ----
 import itertools as _itx
 

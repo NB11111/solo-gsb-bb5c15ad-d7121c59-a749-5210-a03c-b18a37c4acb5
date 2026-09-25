@@ -227,6 +227,7 @@ th{color:var(--mut);font-weight:500}
       <button id="btnEvac" disabled title="对已保存方案做失效槽位应急迁移(只读, 精确枚举)">失效槽位应急迁移</button>
       <button id="btnRecheck" disabled title="对已保存方案做现场装管复核(只读, 一对一匹配)">现场装管复核</button>
       <button id="btnReweigh" disabled title="对已保存方案做复称规划(只读, 精确枚举复称组合)">复称规划</button>
+      <button id="btnCw" disabled title="对已保存方案做库存配重补偿(只读, 按枚数分层精确枚举槽位×质量组合)">库存配重补偿</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -537,6 +538,48 @@ th{color:var(--mut);font-weight:500}
 </div>
 
 <div id="toast" class="toast"></div>
+
+<div id="cwDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">库存配重补偿</h2><div style="flex:1"></div>
+      <button id="btnCloseCw" class="ghost">关闭</button></div>
+    <div class="wc-note">试管质量、槽角、半径与占用状态<b>只读</b>取自该方案, 不可修改。
+      录入至多 <b>6 种</b>标准配重(质量与库存件数)、<b>一阶不平衡量限值</b>与
+      <b>最多放置枚数</b>(0~3)。服务端仅处理至多 <b>16 个空闲启用槽位</b>,
+      按放置枚数分层<b>精确枚举</b>槽位与配重质量的联合组合: 配重只放<b>空闲启用槽</b>、
+      单槽至多一枚、每种用量不超库存(同质量种类合并库存); 先求能达标的<b>最少放置枚数</b>,
+      再在该枚数内取<b>残余 |U₁| 最低</b>的组合, 并列按<b>槽号及对应质量序列</b>升序裁决;
+      限额内无法达标时给出残余最低的组合与超限量, <b>不误报达标</b>。
+      结果为<b>只读</b>, 不保存、不覆盖原方案。</div>
+    <div id="cwMeta" class="small" style="margin:4px 0 8px"></div>
+    <h2 style="font-size:13px;margin:8px 0 6px">① 标准配重(质量 + 库存件数, 至多 6 种)</h2>
+    <div style="max-height:170px;overflow:auto">
+      <table class="wc-table">
+        <thead><tr><th style="width:70px">种类</th><th style="width:170px">质量(g)</th>
+          <th style="width:150px">库存件数</th><th style="width:44px"></th></tr></thead>
+        <tbody id="cwWeightBody"></tbody>
+      </table>
+    </div>
+    <div class="rowline" style="margin-top:6px">
+      <button id="btnCwAdd" class="iconbtn">+ 添加配重种类</button>
+      <span class="small" id="cwWeightCount"></span>
+    </div>
+    <div class="rowline" style="gap:10px;flex-wrap:wrap;margin:10px 0 8px">
+      <div style="flex:1;min-width:190px">
+        <label>② 一阶不平衡量限值 |U₁| (g·mm), 必填</label>
+        <input id="cwLimit" type="number" min="0" step="any" placeholder="例如 1000">
+      </div>
+      <div style="min-width:150px">
+        <label>③ 最多放置枚数 (0~3)</label>
+        <input id="cwMaxWeights" type="number" min="0" max="3" step="1" value="3">
+      </div>
+      <div style="align-self:flex-end">
+        <button id="btnCwRun" class="primary">计算补偿方案</button>
+      </div>
+    </div>
+    <div id="cwResult" style="margin-top:6px"></div>
+  </div>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

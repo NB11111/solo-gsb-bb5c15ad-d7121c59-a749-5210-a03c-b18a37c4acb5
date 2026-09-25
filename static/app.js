@@ -328,13 +328,14 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
-  // 误差校核/振动校准/逐管装载/应急迁移/装管复核/复称规划只针对已保存方案: 未保存(草稿)时禁用
+  // 误差校核/振动校准/逐管装载/应急迁移/装管复核/复称规划/配重补偿只针对已保存方案: 未保存(草稿)时禁用
   $("btnWeighing").disabled = !(record.id !== null && record.id !== undefined);
   $("btnCalib").disabled = !(record.id !== null && record.id !== undefined);
   $("btnLoading").disabled = !(record.id !== null && record.id !== undefined);
   $("btnEvac").disabled = !(record.id !== null && record.id !== undefined);
   $("btnRecheck").disabled = !(record.id !== null && record.id !== undefined);
   $("btnReweigh").disabled = !(record.id !== null && record.id !== undefined);
+  $("btnCw").disabled = !(record.id !== null && record.id !== undefined);
 
   drawRotor(r);
   renderPairs(r);
@@ -605,6 +606,7 @@ async function renderHistory() {
         <button class="iconbtn" data-a="evac">应急迁移</button>
         <button class="iconbtn" data-a="recheck">装管复核</button>
         <button class="iconbtn" data-a="reweigh">复称规划</button>
+        <button class="iconbtn" data-a="cw">配重补偿</button>
         <button class="iconbtn" data-a="export">导出</button>
         <button class="iconbtn" data-a="del">删除</button>
       </div>`;
@@ -627,6 +629,7 @@ async function renderHistory() {
     d.querySelector('[data-a="evac"]').onclick = () => openEvacDialog(it.id);
     d.querySelector('[data-a="recheck"]').onclick = () => openRecheckDialog(it.id);
     d.querySelector('[data-a="reweigh"]').onclick = () => openReweighDialog(it.id);
+    d.querySelector('[data-a="cw"]').onclick = () => openCwDialog(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
     d.querySelector('[data-a="del"]').onclick = async () => {
       if (!confirm(`删除方案 #${it.id}?`)) return;
@@ -1896,6 +1899,205 @@ $("btnReweigh").onclick = () => {
   }
 };
 $("btnCloseReweigh").onclick = () => $("reweighDialog").classList.remove("open");
+
+// ---------------------------------------------------------------------------
+// 库存配重补偿(只读, 基于已保存方案; 按放置枚数分层精确枚举槽位×质量组合)
+// ---------------------------------------------------------------------------
+const cwState = { planId: null, weights: [] };
+
+async function openCwDialog(id) {
+  $("btnCw")?.blur();
+  try {
+    const resp = await fetch(`/api/plan/${id}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "方案读取失败");
+    cwState.planId = id;
+    const free = data.result.slot_state
+      .filter((s) => s.enabled && (s.tube_id === null || s.tube_id === undefined))
+      .sort((a, b) => a.slot - b.slot);
+    const placed = data.result.placements
+      .filter((p) => p.slot !== null && p.slot !== undefined).length;
+    const tooMany = free.length > 16;
+    $("cwMeta").innerHTML =
+      `方案 <b>#${data.id} ${data.name}</b> · ${new Date(data.created_at).toLocaleString()} ·
+       R=${data.request.radius_mm}mm · ${data.result.config.rpm} rpm ·
+       ${placed} 支已放置试管 · 空闲启用槽 <b>${free.length}</b> 个` +
+      (free.length ? `: ${free.map((s) => `#${s.slot}`).join("、")}` : "「配重无处可放」") +
+      ` · 补偿前 |U₁|=${fmt(data.result.metrics.u1_mag_g_mm)} g·mm` +
+      (tooMany ? ' · <span class="wc-hi">空闲启用槽超过 16 个, 服务端将拒绝规划</span>' : "");
+    cwState.weights = [
+      { mass: 1, stock: 3 }, { mass: 2, stock: 3 }, { mass: 5, stock: 3 },
+    ];
+    $("cwLimit").value = "";
+    $("cwMaxWeights").value = "3";
+    $("cwResult").innerHTML = "";
+    $("btnCwRun").disabled = placed === 0 || tooMany;
+    renderCwWeights();
+    $("cwDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function renderCwWeights() {
+  const tb = $("cwWeightBody");
+  tb.innerHTML = "";
+  cwState.weights.forEach((w, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>配重 ${i + 1}</td>
+      <td><input type="number" min="0" step="any" data-f="mass" value="${w.mass}" placeholder="如 5"></td>
+      <td><input type="number" min="0" step="1" data-f="stock" value="${w.stock}" placeholder="非负整数"></td>
+      <td><button class="iconbtn" data-act="del">删</button></td>`;
+    tr.querySelector('[data-f="mass"]').oninput = (e) => { w.mass = e.target.value; };
+    tr.querySelector('[data-f="stock"]').oninput = (e) => { w.stock = e.target.value; };
+    tr.querySelector('[data-act="del"]').onclick = () => {
+      cwState.weights.splice(i, 1);
+      renderCwWeights();
+    };
+    tb.appendChild(tr);
+  });
+  $("cwWeightCount").textContent = `共 ${cwState.weights.length} / 6 种`;
+}
+
+$("btnCwAdd").onclick = () => {
+  if (cwState.weights.length >= 6) { toast("标准配重最多 6 种。", true); return; }
+  cwState.weights.push({ mass: "", stock: 1 });
+  renderCwWeights();
+};
+
+$("btnCwRun").onclick = async () => {
+  const btn = $("btnCwRun");
+  btn.disabled = true;
+  try {
+    if (!cwState.weights.length) { toast("请至少录入一种标准配重。", true); return; }
+    if (cwState.weights.length > 6) { toast("标准配重最多 6 种。", true); return; }
+    const weights = [];
+    for (const [i, w] of cwState.weights.entries()) {
+      const m = parseFloat(w.mass);
+      if (!(m > 0) || !Number.isFinite(m)) {
+        toast(`第 ${i + 1} 种配重的质量必须为正的有限数。`, true); return;
+      }
+      const s = Number(w.stock);
+      if (!Number.isInteger(s) || s < 0) {
+        toast(`第 ${i + 1} 种配重的库存件数必须为非负整数。`, true); return;
+      }
+      weights.push({ mass_g: m, stock: s });
+    }
+    const limit = parseFloat($("cwLimit").value);
+    if (!(limit >= 0) || !Number.isFinite(limit)) {
+      toast("一阶不平衡量限值必须为非负有限数。", true); return;
+    }
+    const maxW = parseInt($("cwMaxWeights").value, 10);
+    if (![0, 1, 2, 3].includes(maxW)) {
+      toast("最多放置枚数必须为 0~3 的整数。", true); return;
+    }
+    const resp = await fetch(`/api/plan/${cwState.planId}/counterweight-compensation`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ weights, u1_limit_g_mm: limit, max_weights: maxW }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "库存配重补偿计算失败");
+    renderCwResult(data);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function renderCwResult(d) {
+  const box = $("cwResult");
+  const baseM = d.baseline.u1_mag_g_mm;
+  const finalM = d.final.u1_mag_g_mm;
+  const placeTxt = d.placements.length
+    ? d.placements.map((p) => `槽 ${p.slot} 放 ${p.mass_g} g`).join("、")
+    : "无";
+
+  let verdict;
+  if (d.feasible && d.weights_used === 0) {
+    verdict = `<div class="wc-ok">✔ <b>达标, 无需放置配重</b>: 补偿前 |U₁|=${fmt(baseM)} g·mm
+      已不超过限值 ${fmt(d.u1_limit_g_mm)} g·mm, 余量 ${fmt(d.margin_g_mm)} g·mm。</div>`;
+  } else if (d.feasible) {
+    verdict = `<div class="wc-ok">✔ <b>达标</b>: 放置 <b>${d.weights_used}</b> 枚配重(${placeTxt})后,
+      残余 |U₁|=${fmt(finalM)} g·mm ≤ 限值 ${fmt(d.u1_limit_g_mm)} g·mm,
+      余量 ${fmt(d.margin_g_mm)} g·mm(补偿前 ${fmt(baseM)} g·mm, 下降 ${fmt(d.improvement_g_mm)})。
+      这是能达标的<b>最少放置枚数</b>${d.tie_broken
+        ? `; 达到该最优结果的组合共 <b>${d.optimal_combination_count}</b> 种, 已按槽号及质量序列升序裁决`
+        : ", 且该枚数下最优组合唯一"}。</div>`;
+  } else {
+    verdict = `<div class="wc-bad">✘ <b>无法达标</b>: 在最多放置 ${d.max_weights} 枚的限制内,
+      没有使残余 |U₁| ≤ 限值 ${fmt(d.u1_limit_g_mm)} g·mm 的组合。
+      限额内残余最低的组合为放置 <b>${d.weights_used}</b> 枚(${placeTxt}),
+      残余 |U₁|=${fmt(finalM)} g·mm, 仍<b>超出 ${fmt(d.excess_g_mm)} g·mm</b>
+      (补偿前 ${fmt(baseM)} g·mm)。</div>`;
+  }
+
+  const typesTxt = d.weight_types.map((w) => `${w.mass_g} g×${w.stock} 件`).join("、");
+  const usableTxt = d.usable_weight_types.length
+    ? d.usable_weight_types.map((w) => `${w.mass_g} g×${w.stock}`).join("、")
+    : "无可用配重(库存均为 0)";
+  const head = `<div class="wc-note">录入配重: ${typesTxt} · 可用(同质量合并后): ${usableTxt} ·
+    最多放置 ${d.max_weights} 枚 · 空闲启用槽 ${d.free_slot_count} 个 ·
+    精确评估组合 ${d.evaluated_combinations} 种 · 转子 R=${fmt(d.radius_mm, 1)} mm。</div>`;
+
+  const cmpTable = `<table class="cmp-table">
+    <thead><tr><th>指标</th><th style="text-align:right">补偿前</th>
+      <th style="text-align:right">补偿后(推荐组合)</th><th style="text-align:right">变化</th></tr></thead>
+    <tbody>
+      <tr><td>一阶不平衡量 |U₁| (g·mm)</td>
+        <td style="text-align:right">${fmt(baseM)}</td>
+        <td style="text-align:right" class="wc-hi">${fmt(finalM)}</td>
+        <td style="text-align:right" class="${d.improvement_g_mm > 1e-12 ? "delta-down" : "delta-flat"}">
+          ${d.improvement_g_mm > 1e-12 ? "−" + fmt(d.improvement_g_mm) : "0"}</td></tr>
+      <tr><td>U₁ 方向</td>
+        <td style="text-align:right">${fmt(d.baseline.u1_angle_deg, 1)}°</td>
+        <td style="text-align:right">${fmt(d.final.u1_angle_deg, 1)}°</td>
+        <td style="text-align:right">–</td></tr>
+      <tr><td>限值 ${fmt(d.u1_limit_g_mm)} g·mm 判定</td>
+        <td style="text-align:right">${d.baseline.within_limit
+          ? '<span class="delta-down">合格</span>'
+          : `<span class="delta-up">超限 ${fmt(d.baseline.excess_g_mm)}</span>`}</td>
+        <td style="text-align:right">${d.within_limit
+          ? '<span class="delta-down">合格</span>'
+          : `<span class="delta-up">超限 ${fmt(d.excess_g_mm)}</span>`}</td>
+        <td style="text-align:right">–</td></tr>
+    </tbody></table>`;
+
+  let placeTable = "";
+  if (d.placements.length) {
+    const rows = d.placements.map((p) => `<tr>
+      <td>#${p.slot} <span class="small">(${fmt(p.angle_deg, 1)}°)</span></td>
+      <td><b>${fmt(p.mass_g, 3)}</b></td>
+      <td style="text-align:right">${fmt(p.u1_x_g_mm)}</td>
+      <td style="text-align:right">${fmt(p.u1_y_g_mm)}</td>
+      <td style="text-align:right">${fmt(p.u1_mag_g_mm)}</td>
+    </tr>`).join("");
+    placeTable = `
+      <h2 style="font-size:13px;margin:10px 0 6px">放置清单
+        <span class="small">配重只放入空闲启用槽, 单槽至多一枚, 每种用量不超库存</span></h2>
+      <table class="cmp-table wc-table">
+        <thead><tr><th>槽位 / 角度</th><th>配重质量(g)</th>
+          <th style="text-align:right">质径积 x (g·mm)</th>
+          <th style="text-align:right">质径积 y (g·mm)</th>
+          <th style="text-align:right">质径积模 (g·mm)</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  box.innerHTML = `${verdict}${head}${cmpTable}${placeTable}
+    <div class="small" style="margin-top:6px">算法: ${d.method}。${d.note}
+      方案 #${d.plan.id} 未被修改。</div>`;
+}
+
+$("btnCw").onclick = () => {
+  if (state.record && state.record.id !== null && state.record.id !== undefined) {
+    openCwDialog(state.record.id);
+  } else {
+    toast("请先从历史方案载入一条已保存方案, 或先计算并保存方案。", true);
+  }
+};
+$("btnCloseCw").onclick = () => $("cwDialog").classList.remove("open");
 
 // ---------------------------------------------------------------------------
 // 标签页 & 初始化
