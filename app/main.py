@@ -19,6 +19,7 @@ from .balancer import run_plan
 from .batch import plan_batch_sequence
 from .calibration import predict_single_weight_balancing
 from .compare import compare_plans
+from .compensation import plan_inventory_compensation
 from .evacuation import plan_slot_evacuation
 from .loading import plan_loading_sequence
 from .recheck import recheck_tube_loading
@@ -165,6 +166,22 @@ class ReweighPlanRequest(BaseModel):
     u1_limit_g_mm: float = Field(ge=0)
     # 最多复称次数(0~3, 控制精确枚举的搜索规模)
     max_reweigh_count: int = Field(ge=0, le=3)
+
+
+class CounterweightIn(BaseModel):
+    # 一种标准配重的单件质量(g), 必须为正; 各规格质量不得重复(由补偿逻辑校验)
+    mass_g: float = Field(gt=0)
+    # 该规格的库存件数, 非负整数; 使用量不得超过库存
+    stock: int = Field(ge=0)
+
+
+class StockCompensationRequest(BaseModel):
+    # 至多 6 种标准配重(单件质量 + 库存件数), 至少 1 种
+    counterweights: list[CounterweightIn] = Field(min_length=1, max_length=6)
+    # 一阶不平衡量限值(g·mm), 必填的非负数
+    u1_limit_g_mm: float = Field(ge=0)
+    # 最多放置枚数(0~3, 配重只放空槽、单槽至多一枚)
+    max_pieces: int = Field(ge=0, le=3)
 
 
 class PlanRequest(BaseModel):
@@ -598,6 +615,30 @@ def reweigh_plan(plan_id: int, req: ReweighPlanRequest) -> dict[str, Any]:
             reweighed_error_bound_g=req.reweighed_error_bound_g,
             u1_limit_g_mm=req.u1_limit_g_mm,
             max_reweigh_count=req.max_reweigh_count,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/plan/{plan_id}/stock-compensation")
+def stock_compensation(plan_id: int, req: StockCompensationRequest) -> dict[str, Any]:
+    """对已保存方案做库存配重补偿(只读): 在空闲启用槽加放标准配重降低 |U₁|。
+
+    方案中的试管质量、槽角、半径与占用状态只读取自方案。录入至多 6 种标准
+    配重的单件质量与库存件数、一阶不平衡量限值与最多放置枚数(0~3); 配重只
+    放空闲启用槽、单槽至多一枚、每种用量不超过库存, 仅处理至多 16 个空闲
+    启用槽。服务端按枚数分层对槽位与质量的联合组合做精确完全枚举, 先找
+    达标的最少枚数, 再在该枚数内取残余 |U₁| 最低者, 平局按槽号升序的
+    (槽号, 质量)序列裁决; 限额内无达标组合时返回残余最低的组合及超限量,
+    不误报达标。结果不保存、不覆盖原方案。
+    """
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    try:
+        return plan_inventory_compensation(
+            plan,
+            counterweights=[c.model_dump() for c in req.counterweights],
+            u1_limit_g_mm=req.u1_limit_g_mm,
+            max_pieces=req.max_pieces,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

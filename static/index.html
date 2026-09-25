@@ -227,6 +227,7 @@ th{color:var(--mut);font-weight:500}
       <button id="btnEvac" disabled title="对已保存方案做失效槽位应急迁移(只读, 精确枚举)">失效槽位应急迁移</button>
       <button id="btnRecheck" disabled title="对已保存方案做现场装管复核(只读, 一对一匹配)">现场装管复核</button>
       <button id="btnReweigh" disabled title="对已保存方案做复称规划(只读, 精确枚举复称组合)">复称规划</button>
+      <button id="btnStock" disabled title="对已保存方案做库存配重补偿(只读, 槽位×质量联合精确枚举)">库存配重补偿</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -533,6 +534,45 @@ th{color:var(--mut);font-weight:500}
       <span class="small">只读操作, 不会修改或覆盖历史方案。</span>
     </div>
     <div id="reweighResult" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<div id="stockDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">库存配重补偿</h2><div style="flex:1"></div>
+      <button id="btnCloseStock" class="ghost">关闭</button></div>
+    <div class="wc-note">固定读取该方案的<b>试管质量、槽角、半径与占用状态</b>, 不可修改。录入至多
+      <b>6 种标准配重</b>的单件质量与<b>库存件数</b>、<b>一阶不平衡量限值</b>与
+      <b>最多放置枚数</b>(0~3)。配重只放方案的<b>空闲启用槽</b>, <b>单槽至多一枚</b>、
+      每种用量<b>不超过库存</b>; 仅处理至多 <b>16 个空闲启用槽</b>。服务端按枚数分层对
+      <b>槽位与质量的联合组合精确完全枚举</b>: 先找达标的<b>最少枚数</b>, 再在该枚数内取
+      残余 |U₁| <b>最低</b>者, 平局按<b>槽号升序的 (槽号, 质量) 序列</b>裁决; 限额内无
+      达标组合时返回<b>残余最低组合与超限量</b>, 不误报达标。补偿为<b>只读</b>,
+      结果不保存、不覆盖原方案。</div>
+    <div id="stockMeta" class="small" style="margin:4px 0 8px"></div>
+    <div class="rowline" style="gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="flex:1;min-width:200px">
+        <label>一阶不平衡量限值 |U₁| (g·mm), 必填</label>
+        <input id="scLimit" type="number" min="0" step="any" placeholder="例如 1000">
+      </div>
+      <div style="min-width:150px">
+        <label>最多放置枚数 (0~3)</label>
+        <input id="scMaxPieces" type="number" min="0" max="3" step="1" value="3">
+      </div>
+      <div style="align-self:flex-end" class="rowline">
+        <button id="btnScAdd" class="iconbtn">+ 添加配重规格</button>
+        <button id="btnScRun" class="primary">计算配重补偿</button>
+      </div>
+    </div>
+    <div style="max-height:230px;overflow:auto">
+      <table class="wc-table">
+        <thead><tr><th style="width:44px">#</th><th style="width:180px">单件质量 (g)</th>
+          <th style="width:160px">库存件数</th><th>方案空槽参考</th><th style="width:44px"></th></tr></thead>
+        <tbody id="scBody"></tbody>
+      </table>
+    </div>
+    <div class="small" id="scCount" style="margin-top:5px"></div>
+    <div id="stockResult" style="margin-top:6px"></div>
   </div>
 </div>
 

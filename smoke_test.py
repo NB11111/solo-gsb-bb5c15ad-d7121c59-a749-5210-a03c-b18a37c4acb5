@@ -1006,6 +1006,148 @@ assert call("GET", f"/api/plan/{rwid}")["result"]["metrics"]["u1_mag_g_mm"] == \
     rec_rw["result"]["metrics"]["u1_mag_g_mm"]
 print("reweigh-plan validation/read-only OK")
 
+# ---- 库存配重补偿(只读, 按枚数分层槽位 × 质量联合完全枚举) ----
+def sc_route(plan_id):
+    found = find("POST", f"/api/plan/{plan_id}/stock-compensation")
+    return (found if isinstance(found, tuple) else (found, ()))
+def sc_call(plan_id, weights, limit, max_pieces):
+    fn, args = sc_route(plan_id)
+    def _cw(m, s):
+        o = types.SimpleNamespace(mass_g=float(m), stock=int(s))
+        o.model_dump = lambda: {"mass_g": o.mass_g, "stock": o.stock}
+        return o
+    req = types.SimpleNamespace(
+        counterweights=[_cw(m, s) for m, s in weights],
+        u1_limit_g_mm=float(limit),
+        max_pieces=int(max_pieces),
+    )
+    return fn(*args, req)
+
+# 确定性方案: 两支 50g 锁定在槽 0/3(非对径, 有非零残余)
+sc_body = dict(ev_body)
+sc_body["name"] = "库存配重补偿方案"
+sc_body["slots"] = [{"index": i, "angle": i * 30, "enabled": True}
+                    for i in range(12)]
+sc_body["tubes"] = [
+    {"id": 1, "mass": 50, "locked": True, "slot": 0},
+    {"id": 2, "mass": 50, "locked": True, "slot": 3},
+]
+rec_sc = call("POST", "/api/plan", sc_body)
+scid = rec_sc["id"]
+sc_base = rec_sc["result"]["metrics"]["u1_mag_g_mm"]
+_cw = [(49.0, 1), (50.0, 2)]
+# 宽松限值: 无需配重
+sc0 = sc_call(scid, _cw, 1e12, 3)
+assert sc0["feasible"] is True and sc0["pieces_required"] == 0
+assert abs(sc0["baseline_u1"]["u1_mag_g_mm"] - sc_base) < 1e-6
+assert abs(sc0["final_u1"]["u1_mag_g_mm"] - sc_base) < 1e-6
+# 严格限值 0: 至多放 1 枚无法达标 -> 残余最低组合 + 超限量, 不误报达标
+sc_no = sc_call(scid, _cw, 0.0, 1)
+assert sc_no["feasible"] is False and sc_no["within_limit"] is False
+assert sc_no["pieces_required"] == 1 and len(sc_no["placements"]) == 1
+assert sc_no["excess_g_mm"] > 0
+assert "不达标" in sc_no["reason"]
+# 枚数 0: 只评估空组合, 残余即基线
+sc_m0 = sc_call(scid, _cw, 0.0, 0)
+assert sc_m0["evaluated_combinations"] == 1
+assert abs(sc_m0["final_u1"]["u1_mag_g_mm"] - sc_base) < 1e-6
+# 库存: 49g 仅 1 件, 用量不超库存; 放置槽必须是空闲启用槽
+sc_occ = {p["slot"] for p in rec_sc["result"]["placements"]}
+for r in sc_no["placements"]:
+    assert r["slot"] not in sc_occ
+    assert 0 <= r["slot"] < 12
+for c in sc_no["counterweights"]:
+    assert c["used"] <= c["stock"]
+    assert c["remaining"] == c["stock"] - c["used"]
+# 独立全枚举交叉验证(槽位子集 × 逐槽质量)
+def _brute_sc(plan, weights, limit, max_pieces):
+    res = plan["result"]; R = res["config"]["radius_mm"]
+    info = {s["slot"]: s for s in res["slot_state"]}
+    occ = {p["slot"] for p in res["placements"] if p["slot"] is not None}
+    free = sorted(s for s, v in info.items() if v["enabled"] and s not in occ)
+    base = 0j
+    for p in res["placements"]:
+        a = _math.radians(p["angle"]); base += R * p["mass"] * complex(
+            _math.cos(a), _math.sin(a))
+    winner = None; effort = None; total = 0
+    for k in range(min(max_pieces, sum(s for _, s in weights)) + 1):
+        leaves = []
+        for subset in _it.combinations(free, k):
+            for ts in _it.product(range(len(weights)), repeat=k):
+                use = [0] * len(weights)
+                for t in ts: use[t] += 1
+                if any(use[j] > weights[j][1] for j in range(len(weights))):
+                    continue
+                u = base
+                for slot, t in zip(subset, ts):
+                    a = _math.radians(info[slot]["angle"])
+                    u += R * weights[t][0] * complex(_math.cos(a), _math.sin(a))
+                key = tuple(sorted((s, weights[t][0]) for s, t in zip(subset, ts)))
+                leaves.append((abs(u), key))
+        total += len(leaves)
+        if not leaves: continue
+        bm = min(m for m, _ in leaves)
+        bk = min(k2 for m, k2 in leaves if m <= bm + 1e-9 * max(1.0, bm))
+        bmag = next(m for m, k2 in leaves if k2 == bk)
+        if effort is None or bmag < effort[0] - 1e-9:
+            effort = (bmag, k, bk)
+        feas = [(m, k2) for m, k2 in leaves if m <= limit + 1e-9 * max(1.0, limit)]
+        if feas and winner is None:
+            fm = min(m for m, _ in feas)
+            fk = min(k2 for m, k2 in feas if m <= fm + 1e-9 * max(1.0, fm))
+            fmag = next(m for m, k2 in feas if k2 == fk)
+            winner = (fmag, k, fk)
+    chosen = winner if winner else effort
+    return winner is not None, chosen[1], chosen[0], chosen[2], total
+
+for lim, mp in ((1000.0, 3), (0.0, 2), (5000.0, 3), (1e9, 3)):
+    r = sc_call(scid, _cw, lim, mp)
+    f, pk, pm, key, tot = _brute_sc(rec_sc, _cw, lim, mp)
+    assert r["feasible"] is f
+    assert r["pieces_required"] == pk
+    assert abs(r["final_u1"]["u1_mag_g_mm"] - pm) < 1e-6 * max(1.0, pm)
+    assert tuple((x["slot"], x["mass_g"]) for x in r["placements"]) == key
+    assert r["evaluated_combinations"] == tot
+print("stock-compensation feasible/infeasible/brute-cross-check OK")
+
+# 校验错误: 规格为空 / 超过 6 种 / 重复质量 / 非整数库存 / 枚数越界 / 负限值 -> 400
+for bad_sc in (
+    ([], 1.0, 3),
+    ([(float(i + 1), 1) for i in range(7)], 1.0, 3),
+    ([(10.0, 1), (10.0, 2)], 1.0, 3),
+    ([(10.0, -1)], 1.0, 3),
+    ([(10.0, 1)], 1.0, 4),
+    ([(10.0, 1)], -1.0, 3),
+):
+    try:
+        sc_call(scid, *bad_sc); raise SystemExit("should 400")
+    except main.HTTPException as e:
+        assert e.status_code == 400, bad_sc
+# 方案不存在 -> 404
+try:
+    sc_call(999, _cw, 1.0, 3); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+# 超过 16 个空闲启用槽 -> 400(24 槽转子放 7 支, 空槽 17 个)
+sc_big = dict(req_body); sc_big["name"] = "24槽7管方案"
+sc_big["slot_count"] = 24
+sc_big["slots"] = [{"index": i, "angle": i * 15.0, "enabled": True} for i in range(24)]
+sc_big["tubes"] = [{"id": i + 1, "mass": 10.0 + i} for i in range(7)]
+rec_scbig = call("POST", "/api/plan", sc_big)
+assert len(rec_scbig["result"]["slot_state"]) == 24
+try:
+    sc_call(rec_scbig["id"], [(10.0, 2)], 1.0, 3); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code == 400 and "16" in str(e.detail), e.detail
+# 恰好 16 个空闲启用槽(24 槽 8 管) -> 接受
+sc_16 = dict(sc_big); sc_16["tubes"] = [{"id": i + 1, "mass": 10.0 + i} for i in range(8)]
+rec_sc16 = call("POST", "/api/plan", sc_16)
+r16 = sc_call(rec_sc16["id"], [(10.0, 1)], 0.0, 0)
+assert r16["free_enabled_slot_count"] == 16 and r16["evaluated_combinations"] == 1
+# 只读: 补偿后原方案指标不变
+assert call("GET", f"/api/plan/{scid}")["result"]["metrics"]["u1_mag_g_mm"] == sc_base
+print("stock-compensation validation/read-only OK")
+
 
 # ---- 互斥试管隔离(精确完全枚举; 禁用槽仍占物理相邻关系) ----
 import itertools as _itx
